@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<extension method="upgrade" type="plugin" group="ajax">
+    <name>Ajax - DT Flowise API</name>
+    <version>1.0</version>
+    <description>This plugin handles Flowise API integration and webhook communication for Joomla sites.</description>
+    <author>Naufal</author>
+	<creationDate>Today</creationDate>
+    <namespace path="src">Joomla\Plugin\Ajax\FlowiseAPI</namespace>
+    <files>
+		<folder plugin="flowiseapi">services</folder>
+		<folder>src</folder>
+	</files>
+    <config>
+    <!-- <fields name="params">
+        <fieldset name="basic">
+            <field name="verify_token" type="text" default="" label="Verify Token" description="Enter your webhook verification token." />
+        </fieldset>
+    </fields> -->
+</config>
+</extension>
