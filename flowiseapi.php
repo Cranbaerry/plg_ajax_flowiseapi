@@ -219,6 +219,9 @@ class PlgAjaxFlowiseapi extends JPlugin
                 $companyQuery->where('(' . $db->quoteName('cd.name') . ' LIKE ' . $searchTermQuoted . ' OR ' . $db->quoteName('cd.clientcode') . ' LIKE ' . $searchTermQuoted . ')');
             }
 
+            // --- 4b. Fetch Company Members and Directors for these Companies ---
+            // Only run these queries after $companyCodesIn is defined
+
             // Validate and apply ordering
             $allowedOrderColumns = array('name', 'clientcode');
             $orderColumn = 'cd.name'; // Default
@@ -229,9 +232,9 @@ class PlgAjaxFlowiseapi extends JPlugin
             $companyQuery->order($db->escape($orderColumn) . ' ' . $db->escape($direction));
 
             // Apply limit
-            if (is_numeric($limit) && $limit > 0) {
-                $companyQuery->setLimit((int)$limit);
-            }
+            // if (is_numeric($limit) && $limit > 0) {
+            //     $companyQuery->setLimit((int)$limit);
+            // }
 
             $db->setQuery($companyQuery);
             $companies = $db->loadObjectList('clientcode'); // Index by clientcode for easier lookup
@@ -251,6 +254,67 @@ class PlgAjaxFlowiseapi extends JPlugin
                 $companyCodesQuoted[] = $db->quote($code);
             }
             $companyCodesIn = implode(',', $companyCodesQuoted);
+
+            // --- Fetch Company Members ---
+            $companyMembers = array();
+            if (!empty($companyCodesIn)) {
+                $memQuery = $db->getQuery(true);
+                $memQuery->select(array(
+                    $db->quoteName('a.clientcode'),
+                    $db->quoteName('b.code'),
+                    $db->quoteName('b.name'),
+                ))
+                ->from($db->quoteName('#__unicornr_table_regmem', 'a'))
+                ->join('LEFT', $db->quoteName('#__unicornr_table_member', 'b') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('b.code'))
+                ->join('LEFT', $db->quoteName('#__unicornr_table_shares', 'c') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('c.memcode'))
+                ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
+                ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
+                ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
+                ->where($db->quoteName('c.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
+                ->group($db->quoteName('b.code'))
+                ->order($db->quoteName('b.name') . ' ASC');
+
+                $db->setQuery($memQuery);
+                $membersList = $db->loadObjectList();
+                if ($db->getErrorNum()) {
+                    throw new Exception('Database error while fetching company members: ' . $db->stderr());
+                }
+                foreach ($membersList as $mem) {
+                    if (!isset($companyMembers[$mem->clientcode])) {
+                        $companyMembers[$mem->clientcode] = array();
+                    }
+                    $companyMembers[$mem->clientcode][] = $mem;
+                }
+            }
+
+            // --- Fetch Company Directors ---
+            $companyDirectors = array();
+            if (!empty($companyCodesIn)) {
+                $dirQuery = $db->getQuery(true);
+                $dirQuery->select(array(
+                    $db->quoteName('a.clientcode'),
+                    $db->quoteName('b.code'),
+                    $db->quoteName('b.name')
+                ))
+                ->from($db->quoteName('#__unicornr_table_regdir', 'a'))
+                ->join('LEFT', $db->quoteName('#__unicornr_table_member', 'b') . ' ON ' . $db->quoteName('a.dircode') . ' = ' . $db->quoteName('b.code'))
+                ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
+                ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
+                ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
+                ->order($db->quoteName('b.name') . ' ASC');
+
+                $db->setQuery($dirQuery);
+                $directorsList = $db->loadObjectList();
+                if ($db->getErrorNum()) {
+                    throw new Exception('Database error while fetching company directors: ' . $db->stderr());
+                }
+                foreach ($directorsList as $dir) {
+                    if (!isset($companyDirectors[$dir->clientcode])) {
+                        $companyDirectors[$dir->clientcode] = array();
+                    }
+                    $companyDirectors[$dir->clientcode][] = $dir;
+                }
+            }
 
             // --- 2. Fetch Transactions for these Companies ---
             $transactions = array();
@@ -357,78 +421,41 @@ class PlgAjaxFlowiseapi extends JPlugin
                 $transactions[$companyCode][] = $tx;
             }
 
-            // --- 3. Fetch Total Active Shares per Company ---
-            $companyTotalShares = array();
-            if (!empty($companyCodesIn)) {
-                $totalSharesQuery = $db->getQuery(true);
-                $totalSharesQuery->select(array(
-                    $db->quoteName('clientcode'),
-                    'SUM(' . $db->quoteName('noshare') . ') AS total_shares'
-                ))
-                ->from($db->quoteName('#__unicornr_table_shares'))
-                ->where($db->quoteName('clientcode') . ' IN (' . $companyCodesIn . ')')
-                ->where('(' . $db->quoteName('docease') . ' IS NULL OR ' . $db->quoteName('docease') . ' = ' . $db->quote('0000-00-00 00:00:00') . ')') // Active shares
-                ->where($db->quoteName('trantype') . ' != ' . $db->quote('CANCELLED')) // Exclude cancelled transactions
-                ->group($db->quoteName('clientcode'));
-
-                $db->setQuery($totalSharesQuery);
-                $totalSharesList = $db->loadObjectList('clientcode');
-                if ($db->getErrorNum()) {
-                    throw new Exception('Database error while fetching total company shares: ' . $db->stderr());
-                }
-                foreach ($totalSharesList as $code => $data) {
-                    $companyTotalShares[$code] = (float) $data->total_shares; // Store as float
-                }
-            }
-
-
-            // --- 4. Fetch Shareholders with Share Counts and Percentages ---
+            // --- 4. Fetch Shareholders with Share Counts and Percentages from table_regmem ---
             $shareholders = array();
-             if (!empty($companyCodesIn)) {
-                // Query shares table, group by member, sum shares, join member details
+            if (!empty($companyCodesIn)) {
                 $shQuery = $db->getQuery(true);
                 $shQuery->select(array(
-                    $db->quoteName('s.clientcode'),
-                    $db->quoteName('s.memcode'),
-                    $db->quoteName('m.name', 'member_name'),
-                    $db->quoteName('m.idtype'),
-                    $db->quoteName('m.icno'),
-                    $db->quoteName('m.passport'),
-                    'SUM(' . $db->quoteName('s.noshare') . ') AS total_member_shares' // Sum shares per member
+                    $db->quoteName('a.clientcode'),
+                    $db->quoteName('a.memcode'),
+                    $db->quoteName('b.name', 'member_name'),
+                    $db->quoteName('a.Tnoshares', 'total_shares'),
+                    $db->quoteName('a.Percent', 'share_percentage')
                 ))
-                ->from($db->quoteName('#__unicornr_table_shares', 's'))
-                ->leftJoin($db->quoteName('#__unicornr_table_member', 'm') . ' ON ' . $db->quoteName('s.memcode') . ' = ' . $db->quoteName('m.code'))
-                ->where($db->quoteName('s.clientcode') . ' IN (' . $companyCodesIn . ')')
-                ->where('(' . $db->quoteName('s.docease') . ' IS NULL OR ' . $db->quoteName('s.docease') . ' = ' . $db->quote('0000-00-00 00:00:00') . ')') // Active shares
-                ->where($db->quoteName('s.trantype') . ' != ' . $db->quote('CANCELLED')) // Exclude cancelled transactions
-                ->group(array(
-                    $db->quoteName('s.clientcode'),
-                    $db->quoteName('s.memcode'),
-                    $db->quoteName('m.name'), // Include non-aggregated columns used in SELECT
-                    $db->quoteName('m.idtype'),
-                    $db->quoteName('m.icno'),
-                    $db->quoteName('m.passport')
-                ))
-                ->order($db->quoteName('s.clientcode') . ' ASC, ' . $db->quoteName('m.name') . ' ASC');
+                ->from($db->quoteName('#__unicornr_table_regmem', 'a'))
+                ->leftJoin($db->quoteName('#__unicornr_table_member', 'b') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('b.code'))
+                ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
+                ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
+                ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
+                ->order($db->quoteName('a.clientcode') . ' ASC, ' . $db->quoteName('b.name') . ' ASC');
 
                 $db->setQuery($shQuery);
                 $shareholdersList = $db->loadObjectList();
-                 if ($db->getErrorNum()) {
-                    throw new Exception('Database error while fetching shareholders and share counts: ' . $db->stderr());
+                if ($db->getErrorNum()) {
+                    throw new Exception('Database error while fetching shareholders from table_regmem: ' . $db->stderr());
                 }
 
                 // Group shareholders by company code
                 foreach ($shareholdersList as $sh) {
-                    // Ensure numeric types for consistency, handle potential non-numeric values if necessary
+                    // Ensure numeric types for consistency
                     $sh->total_shares = is_numeric($sh->total_shares) ? (float) $sh->total_shares : 0;
-                    // $sh->share_percentage = is_numeric($sh->share_percentage) ? (float) $sh->share_percentage : 0; // Removed as per user request
-
+                    $sh->share_percentage = is_numeric($sh->share_percentage) ? (float) $sh->share_percentage : 0;
                     if (!isset($shareholders[$sh->clientcode])) {
                         $shareholders[$sh->clientcode] = array();
                     }
                     $shareholders[$sh->clientcode][] = $sh;
                 }
-             }
+            }
 
             // --- 5. Fetch Detailed Certificate Info for these Companies ---
             $certificates = array();
@@ -442,7 +469,6 @@ class PlgAjaxFlowiseapi extends JPlugin
                     $db->quoteName('m.name', 'member_name'),
                     $db->quoteName('m.add1'), $db->quoteName('m.add2'), $db->quoteName('m.add3'),
                     $db->quoteName('m.postcode'), $db->quoteName('m.town'),
-                    $db->quoteName('s.sharecls'),
                     $db->quoteName('s.tranno'),
                     $db->quoteName('s.trandate'),
                     $db->quoteName('s.docease')
@@ -497,7 +523,6 @@ class PlgAjaxFlowiseapi extends JPlugin
                             'member_code' => $cert->memcode,
                             'member_name' => $cert->member_name,
                             'member_address' => $memberAddress,
-                            'share_class' => $cert->sharecls,
                             'transaction_number' => $cert->tranno,
                             'transaction_date' => JHTML::_('date', $cert->trandate, 'Y-m-d'), // Format date
                             'date_of_cease' => $dateOfCease,
@@ -545,16 +570,15 @@ class PlgAjaxFlowiseapi extends JPlugin
 
             // --- 7. Assemble Results ---
             foreach ($companies as $clientcode => $company) {
-                 $results[] = array(
-                     'company_info' => $company,
-                     'transactions' => isset($transactions[$clientcode]) ? $transactions[$clientcode] : array(),
-                     'shareholders' => isset($shareholders[$clientcode]) ? $shareholders[$clientcode] : array(),
-                     'certificates' => isset($certificates[$clientcode]) ? $certificates[$clientcode] : array(), 
-                     // Use the new upcoming share price data
-                     'upcoming_share_price' => isset($upcomingSharePrices[$clientcode]) ? $upcomingSharePrices[$clientcode] : 'No Upcoming Share Price',
-                     // Remove or keep 'latest_share_info' depending on requirements
-                     // 'latest_share_info' => isset($sharePrices[$clientcode]) ? $sharePrices[$clientcode] : null, // Commented out old field
-                 );
+                $results[] = array(
+                    'company_info' => $company,
+                    'transactions' => isset($transactions[$clientcode]) ? $transactions[$clientcode] : array(),
+                    'shareholders' => isset($shareholders[$clientcode]) ? $shareholders[$clientcode] : array(),
+                    'certificates' => isset($certificates[$clientcode]) ? $certificates[$clientcode] : array(),
+                    'upcoming_share_price' => isset($upcomingSharePrices[$clientcode]) ? $upcomingSharePrices[$clientcode] : 'No Upcoming Share Price',
+                    'company_members' => isset($companyMembers[$clientcode]) ? $companyMembers[$clientcode] : array(),
+                    'company_directors' => isset($companyDirectors[$clientcode]) ? $companyDirectors[$clientcode] : array(),
+                );
             }
 
             JLog::add('getCompanyDetails executed successfully. Found ' . count($results) . ' companies.', JLog::INFO, 'flowiseapi');
