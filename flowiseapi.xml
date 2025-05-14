@@ -1,20 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
-<extension method="upgrade" type="plugin" group="ajax">
-    <name>Ajax - DT Flowise API</name>
-    <version>1.0</version>
-    <description>This plugin handles Flowise API integration and webhook communication for Joomla sites.</description>
-    <author>Naufal</author>
-	<creationDate>Today</creationDate>
-    <namespace path="src">Joomla\Plugin\Ajax\FlowiseAPI</namespace>
-    <files>
-		<folder plugin="flowiseapi">services</folder>
-		<folder>src</folder>
+<extension type="plugin" version="3.9" group="ajax" method="upgrade">
+	<name>plg_ajax_flowiseapi</name>
+	<author>Your Name</author>
+	<creationDate>April 2023</creationDate>
+	<copyright>Copyright (C) 2023 Your Name. All rights reserved.</copyright>
+	<license>GNU General Public License version 2 or later; see LICENSE.txt</license>
+	<authorEmail>your.email@example.com</authorEmail>
+	<authorUrl>www.example.com</authorUrl>
+	<version>1.0.0</version>
+	<description>AJAX plugin for Flowise API integration with SP LMS</description>
+	<files>
+		<filename plugin="flowiseapi">flowiseapi.php</filename>
 	</files>
-    <config>
-    <!-- <fields name="params">
-        <fieldset name="basic">
-            <field name="verify_token" type="text" default="" label="Verify Token" description="Enter your webhook verification token." />
-        </fieldset>
-    </fields> -->
-</config>
+	<config>
+		<fields name="params">
+			<fieldset name="basic">
+				<field
+					name="debug"
+					type="radio"
+					label="Enable Debug"
+					description="Enable detailed debug logging"
+					default="0"
+					class="btn-group btn-group-yesno"
+				>
+					<option value="1">JYES</option>
+					<option value="0">JNO</option>
+				</field>
+			</fieldset>
+		</fields>
+	</config>
 </extension>
