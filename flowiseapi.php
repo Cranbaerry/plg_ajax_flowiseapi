@@ -54,7 +54,7 @@ class PlgAjaxFlowiseapi extends JPlugin
         );
 
         JLog::add('FlowiseAPI plugin initialized', JLog::INFO, 'flowiseapi');
-        
+
         // Create a file to verify the plugin is being loaded
         $logPath = JPATH_ROOT . '/tmp/flowiseapi_loaded.txt';
         @file_put_contents($logPath, date('Y-m-d H:i:s') . " - Plugin loaded\n", FILE_APPEND);
@@ -72,23 +72,23 @@ class PlgAjaxFlowiseapi extends JPlugin
     {
         try {
             JLog::add('onAjaxFlowiseapi called', JLog::INFO, 'flowiseapi');
-            
+
             $app = JFactory::getApplication();
             $input = $app->input;
             $method = $input->get('method', 'getTest', 'cmd');
-            
+
             JLog::add('Method requested: ' . $method, JLog::INFO, 'flowiseapi');
-            
+
             if (empty($method)) {
                 throw new Exception('No method specified');
             }
-            
+
             $params = $input->getArray();
             unset($params['option'], $params['plugin'], $params['format']);
-            
+
             // Get all methods in this class
             $classMethods = get_class_methods($this);
-            
+
             // Find the correct method name regardless of case
             $actualMethod = null;
             foreach ($classMethods as $classMethod) {
@@ -97,23 +97,23 @@ class PlgAjaxFlowiseapi extends JPlugin
                     break;
                 }
             }
-            
+
             // If we found a matching method, use it, otherwise use the original (which will fail)
             if ($actualMethod) {
                 $method = $actualMethod;
             }
-            
+
             if (!method_exists($this, $method)) {
                 JLog::add('Method does not exist: ' . $method, JLog::ERROR, 'flowiseapi');
                 throw new Exception('Invalid method specified: ' . $method);
             }
-            
+
             $reflection = new ReflectionMethod($this, $method);
             if (!$reflection->isPublic()) {
                 JLog::add('Method is not public: ' . $method, JLog::ERROR, 'flowiseapi');
                 throw new Exception('Method is not accessible: ' . $method);
             }
-            
+
             $orderedParams = [];
             foreach ($reflection->getParameters() as $param) {
                 $name = $param->getName();
@@ -126,18 +126,18 @@ class PlgAjaxFlowiseapi extends JPlugin
                     throw new Exception("Missing required parameter: $name");
                 }
             }
-            
+
             JLog::add('Invoking method: ' . $method . ' with params: ' . json_encode($orderedParams), JLog::INFO, 'flowiseapi');
-            
+
             // Call the method with the right parameters
             $result = call_user_func_array(array($this, $method), $orderedParams);
-            
+
             JLog::add('Method execution successful', JLog::INFO, 'flowiseapi');
-            
+
             // Explicitly create a JsonResponse object for success
             // This ensures the $result array is correctly placed in the 'data' field
             return $result;
-            
+
         } catch (Exception $e) {
             JLog::add('Error in AJAX handling: ' . $e->getMessage(), JLog::ERROR, 'flowiseapi');
             // Return JsonResponse for errors too, for consistency
@@ -163,35 +163,89 @@ class PlgAjaxFlowiseapi extends JPlugin
             'time' => date('Y-m-d H:i:s')
         );
     }
-    
+
     /**
-     * Get company details including transactions, shareholders, certificates, and share price info.
-     * 
-     * Retrieves a list of companies matching the search term, along with their associated data.
-     * 
-     * @param string $searchTerm Optional search term to filter companies by name or code.
+     * Get company details (including transactions, shareholders, certificates, and share price info) for companies related to a user's phone number.
+     *
+     * Retrieves a list of companies where the given phone number (from the 'hphone' field in table_member) is associated with a member as a shareholder or director.
+     *
+     * @param string $phone_number The user's phone number to filter companies by (required).
      * @param int    $limit      Optional maximum number of companies to return (default: 10).
      * @param string $orderBy    Optional field to sort companies by (default: 'name', allowed: 'name', 'clientcode').
      * @param string $orderDir   Optional sort direction ('asc' or 'desc', default: 'asc').
-     * 
-     * @return array List of companies with detailed information. Each element in the array is an associative array representing a company, 
+     *
+     * @return array List of companies with detailed information. Each element in the array is an associative array representing a company,
      *               containing the following keys:
      *               - 'company_info': (object) Basic details of the company (id, name, code, etc.).
      *               - 'transactions': (array) List of transactions associated with the company. Each transaction is an object.
      *               - 'shareholders': (array) List of shareholders for the company. Each shareholder is an object with details like name, shares, etc.
      *               - 'certificates': (array) List of share certificates issued by the company. Each certificate is an associative array.
      *               - 'upcoming_share_price': (string) The latest upcoming share price from history logs, or a default message if none found.
-     * 
-     * @example Call via: index.php?option=com_ajax&plugin=flowiseapi&format=json&method=getCompanyDetails&searchTerm=TestCompany
+     *               - 'company_members': (array) List of company members.
+     *               - 'company_directors': (array) List of company directors.
+     *
+     * @example Call via: index.php?option=com_ajax&plugin=flowiseapi&format=json&method=getCompanyDetails&phone_number=0123456789
      */
-    public function getCompanyDetails($searchTerm = '', $limit = 10, $orderBy = 'name', $orderDir = 'asc')
+    public function getCompanyDetails($phone_number = '', $limit = 10, $orderBy = 'name', $orderDir = 'asc')
     {
-        JLog::add('getCompanyDetails called with searchTerm: ' . $searchTerm . ', limit: ' . $limit, JLog::INFO, 'flowiseapi');
+
+        JLog::add('getCompanyDetails called', JLog::INFO, 'flowiseapi');
         $db = JFactory::getDbo();
         $results = array();
 
         try {
-            // --- 1. Fetch Companies ---
+            // --- 2. Find all member codes with this phone number ---
+            $memberQuery = $db->getQuery(true);
+            $memberQuery->select($db->quoteName('code'))
+                ->from($db->quoteName('#__unicornr_table_member'))
+                ->where($db->quoteName('hphone') . ' = ' . $db->quote($phone_number));
+            $db->setQuery($memberQuery);
+            $memberCodes = $db->loadColumn();
+            if ($db->getErrorNum()) {
+                throw new Exception('Database error while fetching member codes by phone: ' . $db->stderr());
+            }
+            if (empty($memberCodes)) {
+                return array('success' => true, 'data' => array(), 'message' => 'No companies found for this phone number.');
+            }
+
+            // --- 3. Find all company codes where this member is a shareholder (regmem) or director (regdir) ---
+            $companyCodes = array();
+            // From regmem (shareholder)
+            $regmemQuery = $db->getQuery(true);
+            $regmemQuery->select($db->quoteName('clientcode'))
+                ->from($db->quoteName('#__unicornr_table_regmem'))
+                ->where($db->quoteName('memcode') . ' IN (' . implode(',', array_map(array($db, 'quote'), $memberCodes)) . ')')
+                ->where($db->quoteName('state') . ' = ' . $db->quote(1))
+                ->where($db->quoteName('docease') . ' = ' . $db->quote('0000-00-00 00:00:00'));
+            $db->setQuery($regmemQuery);
+            $regmemCompanyCodes = $db->loadColumn();
+            if ($db->getErrorNum()) {
+                throw new Exception('Database error while fetching company codes from regmem: ' . $db->stderr());
+            }
+            // From regdir (director)
+            $regdirQuery = $db->getQuery(true);
+            $regdirQuery->select($db->quoteName('clientcode'))
+                ->from($db->quoteName('#__unicornr_table_regdir'))
+                ->where($db->quoteName('dircode') . ' IN (' . implode(',', array_map(array($db, 'quote'), $memberCodes)) . ')')
+                ->where($db->quoteName('state') . ' = ' . $db->quote(1))
+                ->where($db->quoteName('docease') . ' = ' . $db->quote('0000-00-00 00:00:00'));
+            $db->setQuery($regdirQuery);
+            $regdirCompanyCodes = $db->loadColumn();
+            if ($db->getErrorNum()) {
+                throw new Exception('Database error while fetching company codes from regdir: ' . $db->stderr());
+            }
+            $allCompanyCodes = array_unique(array_merge($regmemCompanyCodes, $regdirCompanyCodes));
+            if (empty($allCompanyCodes)) {
+                return array('success' => true, 'data' => array(), 'message' => 'No companies found for this phone number.');
+            }
+
+            // --- 4. Fetch Companies for these codes ---
+            $companyCodesQuoted = array();
+            foreach ($allCompanyCodes as $code) {
+                $companyCodesQuoted[] = $db->quote($code);
+            }
+            $companyCodesIn = implode(',', $companyCodesQuoted);
+
             $companyQuery = $db->getQuery(true);
             $companyQuery->select(array(
                 $db->quoteName('id'),
@@ -210,14 +264,10 @@ class PlgAjaxFlowiseapi extends JPlugin
                 $db->quoteName('yearend') . ' AS financial_year_end',
                 $db->quoteName('lastagm') . ' AS last_agm_date',
                 $db->quoteName('lastar') . ' AS last_ar_date',
-                $db->quoteName('comno') . ' AS company_number' // Alias comno from previous step
+                $db->quoteName('comno') . ' AS company_number'
             ))
-            ->from($db->quoteName('#__unicornr_table_clientdata', 'cd'));
-
-            if (!empty($searchTerm)) {
-                $searchTermQuoted = $db->quote('%' . $db->escape($searchTerm, true) . '%', false);
-                $companyQuery->where('(' . $db->quoteName('cd.name') . ' LIKE ' . $searchTermQuoted . ' OR ' . $db->quoteName('cd.clientcode') . ' LIKE ' . $searchTermQuoted . ')');
-            }
+                ->from($db->quoteName('#__unicornr_table_clientdata', 'cd'))
+                ->where($db->quoteName('cd.clientcode') . ' IN (' . $companyCodesIn . ')');
 
             // --- 4b. Fetch Company Members and Directors for these Companies ---
             // Only run these queries after $companyCodesIn is defined
@@ -244,7 +294,7 @@ class PlgAjaxFlowiseapi extends JPlugin
             }
 
             if (empty($companies)) {
-                JLog::add('No companies found matching search term: ' . $searchTerm, JLog::INFO, 'flowiseapi');
+                JLog::add('No companies found matching search term: ' . $phone_number, JLog::INFO, 'flowiseapi');
                 return array('success' => true, 'data' => array(), 'message' => 'No companies found.');
             }
 
@@ -264,15 +314,15 @@ class PlgAjaxFlowiseapi extends JPlugin
                     $db->quoteName('b.code'),
                     $db->quoteName('b.name'),
                 ))
-                ->from($db->quoteName('#__unicornr_table_regmem', 'a'))
-                ->join('LEFT', $db->quoteName('#__unicornr_table_member', 'b') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('b.code'))
-                ->join('LEFT', $db->quoteName('#__unicornr_table_shares', 'c') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('c.memcode'))
-                ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
-                ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
-                ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
-                ->where($db->quoteName('c.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
-                ->group($db->quoteName('b.code'))
-                ->order($db->quoteName('b.name') . ' ASC');
+                    ->from($db->quoteName('#__unicornr_table_regmem', 'a'))
+                    ->join('LEFT', $db->quoteName('#__unicornr_table_member', 'b') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('b.code'))
+                    ->join('LEFT', $db->quoteName('#__unicornr_table_shares', 'c') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('c.memcode'))
+                    ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
+                    ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
+                    ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
+                    ->where($db->quoteName('c.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
+                    ->group($db->quoteName('b.code'))
+                    ->order($db->quoteName('b.name') . ' ASC');
 
                 $db->setQuery($memQuery);
                 $membersList = $db->loadObjectList();
@@ -296,12 +346,12 @@ class PlgAjaxFlowiseapi extends JPlugin
                     $db->quoteName('b.code'),
                     $db->quoteName('b.name')
                 ))
-                ->from($db->quoteName('#__unicornr_table_regdir', 'a'))
-                ->join('LEFT', $db->quoteName('#__unicornr_table_member', 'b') . ' ON ' . $db->quoteName('a.dircode') . ' = ' . $db->quoteName('b.code'))
-                ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
-                ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
-                ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
-                ->order($db->quoteName('b.name') . ' ASC');
+                    ->from($db->quoteName('#__unicornr_table_regdir', 'a'))
+                    ->join('LEFT', $db->quoteName('#__unicornr_table_member', 'b') . ' ON ' . $db->quoteName('a.dircode') . ' = ' . $db->quoteName('b.code'))
+                    ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
+                    ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
+                    ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
+                    ->order($db->quoteName('b.name') . ' ASC');
 
                 $db->setQuery($dirQuery);
                 $directorsList = $db->loadObjectList();
@@ -332,11 +382,11 @@ class PlgAjaxFlowiseapi extends JPlugin
                     $db->quoteName('ttype.fielddata', 'transaction_type_name'),
                     $db->quoteName('tstatus.fielddata', 'transaction_status_name')
                 ))
-                ->from($db->quoteName('#__unicornr_transaction', 't'))
-                ->leftJoin($db->quoteName('#__unicornr_transaction_custom', 'ttype') . ' ON (' . $db->quoteName('t.transtype') . ' = ' . $db->quoteName('ttype.id') . ' AND ' . $db->quoteName('ttype.fieldtype') . ' = ' . $db->quote('transaction') . ')')
-                ->leftJoin($db->quoteName('#__unicornr_transaction_custom', 'tstatus') . ' ON (' . $db->quoteName('t.transstatus') . ' = ' . $db->quoteName('tstatus.id') . ' AND ' . $db->quoteName('tstatus.fieldtype') . ' = ' . $db->quote('status') . ')')
-                ->where($db->quoteName('t.assignedcompany') . ' IN (' . $companyCodesIn . ')') // Use original column name here
-                ->order($db->quoteName('t.assignedcompany') . ' ASC, ' . $db->quoteName('t.createddate') . ' DESC'); // Use original column name here
+                    ->from($db->quoteName('#__unicornr_transaction', 't'))
+                    ->leftJoin($db->quoteName('#__unicornr_transaction_custom', 'ttype') . ' ON (' . $db->quoteName('t.transtype') . ' = ' . $db->quoteName('ttype.id') . ' AND ' . $db->quoteName('ttype.fieldtype') . ' = ' . $db->quote('transaction') . ')')
+                    ->leftJoin($db->quoteName('#__unicornr_transaction_custom', 'tstatus') . ' ON (' . $db->quoteName('t.transstatus') . ' = ' . $db->quoteName('tstatus.id') . ' AND ' . $db->quoteName('tstatus.fieldtype') . ' = ' . $db->quote('status') . ')')
+                    ->where($db->quoteName('t.assignedcompany') . ' IN (' . $companyCodesIn . ')') // Use original column name here
+                    ->order($db->quoteName('t.assignedcompany') . ' ASC, ' . $db->quoteName('t.createddate') . ' DESC'); // Use original column name here
 
                 $db->setQuery($transQuery);
                 $transactionsList = $db->loadObjectList();
@@ -432,12 +482,12 @@ class PlgAjaxFlowiseapi extends JPlugin
                     $db->quoteName('a.Tnoshares', 'total_shares'),
                     $db->quoteName('a.Percent', 'share_percentage')
                 ))
-                ->from($db->quoteName('#__unicornr_table_regmem', 'a'))
-                ->leftJoin($db->quoteName('#__unicornr_table_member', 'b') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('b.code'))
-                ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
-                ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
-                ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
-                ->order($db->quoteName('a.clientcode') . ' ASC, ' . $db->quoteName('b.name') . ' ASC');
+                    ->from($db->quoteName('#__unicornr_table_regmem', 'a'))
+                    ->leftJoin($db->quoteName('#__unicornr_table_member', 'b') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('b.code'))
+                    ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
+                    ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
+                    ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
+                    ->order($db->quoteName('a.clientcode') . ' ASC, ' . $db->quoteName('b.name') . ' ASC');
 
                 $db->setQuery($shQuery);
                 $shareholdersList = $db->loadObjectList();
@@ -467,19 +517,22 @@ class PlgAjaxFlowiseapi extends JPlugin
                     $db->quoteName('s.noshare'),
                     $db->quoteName('s.memcode'),
                     $db->quoteName('m.name', 'member_name'),
-                    $db->quoteName('m.add1'), $db->quoteName('m.add2'), $db->quoteName('m.add3'),
-                    $db->quoteName('m.postcode'), $db->quoteName('m.town'),
+                    $db->quoteName('m.add1'),
+                    $db->quoteName('m.add2'),
+                    $db->quoteName('m.add3'),
+                    $db->quoteName('m.postcode'),
+                    $db->quoteName('m.town'),
                     $db->quoteName('s.tranno'),
                     $db->quoteName('s.trandate'),
                     $db->quoteName('s.docease')
                 ))
-                ->from($db->quoteName('#__unicornr_table_shares', 's'))
-                ->leftJoin($db->quoteName('#__unicornr_table_member', 'm') . ' ON ' . $db->quoteName('s.memcode') . ' = ' . $db->quoteName('m.code'))
-                ->where($db->quoteName('s.clientcode') . ' IN (' . $companyCodesIn . ')')
-                ->where($db->quoteName('s.certno') . ' IS NOT NULL')
-                ->where($db->quoteName('s.certno') . ' != ' . $db->quote(''))
-                // Order by clientcode, certno, and then trandate descending to easily pick the latest relevant record per cert
-                ->order($db->quoteName('s.clientcode') . ' ASC, ' . $db->quoteName('s.certno') . ' ASC, ' . $db->quoteName('s.trandate') . ' DESC');
+                    ->from($db->quoteName('#__unicornr_table_shares', 's'))
+                    ->leftJoin($db->quoteName('#__unicornr_table_member', 'm') . ' ON ' . $db->quoteName('s.memcode') . ' = ' . $db->quoteName('m.code'))
+                    ->where($db->quoteName('s.clientcode') . ' IN (' . $companyCodesIn . ')')
+                    ->where($db->quoteName('s.certno') . ' IS NOT NULL')
+                    ->where($db->quoteName('s.certno') . ' != ' . $db->quote(''))
+                    // Order by clientcode, certno, and then trandate descending to easily pick the latest relevant record per cert
+                    ->order($db->quoteName('s.clientcode') . ' ASC, ' . $db->quoteName('s.certno') . ' ASC, ' . $db->quoteName('s.trandate') . ' DESC');
 
                 $db->setQuery($certQuery);
                 $certificatesList = $db->loadObjectList();
@@ -544,19 +597,19 @@ class PlgAjaxFlowiseapi extends JPlugin
                     $db->quoteName('custom_field1', 'upcoming_price'), // Alias for clarity
                     $db->quoteName('custom_field2', 'clientcode')     // Need clientcode to map results
                 ))
-                ->from($db->quoteName('#__unicornr_history_logs'))
-                ->where($db->quoteName('state') . " = " . $db->quote(1))
-                ->where($db->quoteName('custom_field2') . ' IN (' . $companyCodesIn . ')') // Filter by relevant company codes
-                ->order(array(
-                    $db->quoteName('custom_field2') . ' ASC', // Group by company first
-                    $db->quoteName('id') . ' DESC'           // Get the latest log entry first within each group
-                ));
+                    ->from($db->quoteName('#__unicornr_history_logs'))
+                    ->where($db->quoteName('state') . " = " . $db->quote(1))
+                    ->where($db->quoteName('custom_field2') . ' IN (' . $companyCodesIn . ')') // Filter by relevant company codes
+                    ->order(array(
+                        $db->quoteName('custom_field2') . ' ASC', // Group by company first
+                        $db->quoteName('id') . ' DESC'           // Get the latest log entry first within each group
+                    ));
 
                 $db->setQuery($logQuery);
                 $allLogEntries = $db->loadObjectList();
                 if ($db->getErrorNum()) {
-                   throw new Exception('Database error while fetching upcoming share price from logs: ' . $db->stderr());
-               }
+                    throw new Exception('Database error while fetching upcoming share price from logs: ' . $db->stderr());
+                }
 
                 // Filter to get only the latest log entry per company
                 foreach ($allLogEntries as $logEntry) {
@@ -589,7 +642,7 @@ class PlgAjaxFlowiseapi extends JPlugin
         } catch (Exception $e) {
             JLog::add('Error in getCompanyDetails: ' . $e->getMessage(), JLog::ERROR, 'flowiseapi');
             // Return an empty array in case of error within this function
-            return array(); 
+            return array();
         }
     }
 }
