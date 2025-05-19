@@ -16,6 +16,7 @@ jimport('joomla.log.log');
 // Import JsonResponse
 use Joomla\CMS\Response\JsonResponse;
 
+
 /**
  * FlowiseAPI Ajax Plugin
  *
@@ -644,5 +645,735 @@ class PlgAjaxFlowiseapi extends JPlugin
             // Return an empty array in case of error within this function
             return array();
         }
+    }
+
+    /**
+     * Get courses and articles with detailed information.
+     * 
+     * Retrieves a list of published courses and articles based on filters.
+     * Results include course details (lessons, reviews based on flags) and article details.
+     * 
+     * @param string $keyword Optional search keyword to filter items by title or description/introtext
+     * @param int $limit Optional maximum number of items (courses and articles each) to return (default: 20, 0 = no limit)
+     * @param int $category_id Optional category ID to filter courses by specific category (articles are not filtered by this)
+     * @param bool $include_lessons Whether to include course lesson details (default: true)
+     * @param bool $include_reviews Whether to include course reviews (default: false)
+     * @param int $user_id Optional user ID to check course enrollment status (default: 0)
+     * 
+     * @return array An array containing two keys: 'courses' and 'articles', each holding a list of items.
+     * 
+     * @example Call via: index.php?option=com_ajax&plugin=flowiseapi&format=json&method=getItems&keyword=joomla&limit=10&category_id=5&include_reviews=1
+     */
+    public function getItems($keyword = '', $limit = 20, $category_id = 0)
+    {
+        $result = ['articles' => []];
+        try {
+            $db = JFactory::getDbo();
+            $articleQuery = $db->getQuery(true)
+                ->select('a.id, a.title, a.alias, a.introtext, a.fulltext, a.catid, a.created, a.images')
+                ->select('cc.title AS category_title, cc.alias AS category_alias')
+                ->from($db->quoteName('#__content', 'a'))
+                ->join('LEFT', $db->quoteName('#__categories', 'cc') . ' ON a.catid = cc.id')
+                ->where('a.state = 1');
+
+            // Filter by search keyword
+            if (!empty($keyword)) {
+                $searchKeyword = '%' . $db->escape($keyword, true) . '%';
+                $articleQuery->where('(a.title LIKE ' . $db->quote($searchKeyword) .
+                    ' OR a.introtext LIKE ' . $db->quote($searchKeyword) . ')');
+            }
+
+            // Order by newest articles first
+            $articleQuery->order('a.created DESC');
+
+            // Apply limit if specified
+            // if ($limit > 0) {
+            //     $articleQuery->setLimit($limit);
+            // }
+
+            $db->setQuery($articleQuery);
+            $articles = $db->loadAssocList();
+
+            // Process articles (format images, get SP Page Builder content)
+            if (!empty($articles)) {
+                $siteRoot = rtrim(JURI::root(), '/'); // JURI (all caps) is correct in Joomla 3
+                foreach ($articles as &$article) {
+                    // Format images
+                    if (!empty($article['images'])) {
+                        $imagePaths = json_decode($article['images']);
+                        if (isset($imagePaths->image_intro) && !empty($imagePaths->image_intro)) {
+                            if (!preg_match('/^(https?:\/\/|www\.)/', $imagePaths->image_intro)) {
+                                $article['intro_image'] = $siteRoot . '/' . $imagePaths->image_intro;
+                            } else {
+                                $article['intro_image'] = $imagePaths->image_intro;
+                            }
+                        }
+                        if (isset($imagePaths->image_fulltext) && !empty($imagePaths->image_fulltext)) {
+                            if (!preg_match('/^(https?:\/\/|www\.)/', $imagePaths->image_fulltext)) {
+                                $article['fulltext_image'] = $siteRoot . '/' . $imagePaths->image_fulltext;
+                            } else {
+                                $article['fulltext_image'] = $imagePaths->image_fulltext;
+                            }
+                        }
+                    }
+                    // Remove original images field if desired
+                    // unset($article['images']); 
+
+                    // Construct Article URL
+                    $article['url'] = $siteRoot . '/courses/' . $article['category_alias'] . '/' . $article['id'] . '-' . $article['alias'];
+
+                    // Check for SP Page Builder content
+                    $spPageBuilderContent = null;
+                    try {
+                        $spQuery = $db->getQuery(true)
+                            ->select('text, title')
+                            ->from($db->quoteName('#__sppagebuilder'))
+                            ->where($db->quoteName('view_id') . ' = ' . (int) $article['id']);
+                        $db->setQuery($spQuery);
+                        $spPageBuilderContent = $db->loadResult();
+                    } catch (Exception $spException) {
+                        // Optionally log error if SP Page Builder table doesn't exist or query fails
+                        // JLog::add('SP Page Builder check failed for article ID ' . $article['id'] . ': ' . $spException->getMessage(), JLog::WARNING, 'flowiseapiarticle');
+                    }
+
+                    // Assign content: SP Page Builder content takes precedence
+                    if (!empty($spPageBuilderContent)) {
+                        $article['content'] = $spPageBuilderContent; // Could be JSON
+                        $article['content_type'] = 'sp_page_builder';
+                    } else {
+                        $article['content'] = $article['fulltext']; // Use standard fulltext if no SPPB content
+                        $article['content_type'] = 'joomla_fulltext';
+                    }
+
+                    // Optionally remove the raw fulltext field
+                    unset($article['fulltext']);
+                }
+            }
+
+            $result['articles'] = $articles;
+            return $result;
+        } catch (Exception $e) {
+            JLog::add('Error in getItems: ' . $e->getMessage(), JLog::ERROR, 'flowiseapiarticle');
+            // Return error within the expected structure if possible
+            return ['error' => $e->getMessage(), 'articles' => []];
+        }
+    }
+
+    /**
+     * URL-safe Base64 encode.
+     */
+    function base64url_encode(string $data): string
+    {
+        return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+    }
+
+    /**
+     * URL-safe Base64 decode.
+     */
+    function base64url_decode(string $data): string
+    {
+        $padding = 4 - (strlen($data) % 4);
+        if ($padding < 4) {
+            $data .= str_repeat('=', $padding);
+        }
+        return base64_decode(strtr($data, '-_', '+/'));
+    }
+
+    /**
+     * Create a JWT using HS256.
+     *
+     * @param array  $payload   The JWT payload.
+     * @param string $secret    The secret key.
+     * @return string           The JWT string.
+     */
+    function jwt_encode(array $payload, string $secret): string
+    {
+        $header = ['alg' => 'HS256', 'typ' => 'JWT'];
+        $segments = [];
+        $segments[] = $this->base64url_encode(json_encode($header));
+        $segments[] = $this->base64url_encode(json_encode($payload));
+        $signature = hash_hmac('sha256', implode('.', $segments), $secret, true);
+
+        $segments[] = $this->base64url_encode($signature);
+
+        return implode('.', $segments);
+    }
+
+    /**
+     * Decode and verify a JWT using HS256.
+     *
+     * @param string $token     The JWT string.
+     * @param string $secret    The secret key.
+     * @return array            Decoded payload.
+     * @throws RuntimeException If token is invalid or expired.
+     */
+    function jwt_decode(string $token, string $secret): array
+    {
+        [$b64header, $b64payload, $b64sig] = explode('.', $token);
+        $header = json_decode($this->base64url_decode($b64header), true);
+        $payload = json_decode($this->base64url_decode($b64payload), true);
+        $sig = $this->base64url_decode($b64sig);
+
+        if (empty($header['alg']) || $header['alg'] !== 'HS256') {
+            throw new \RuntimeException('Unsupported JWT algorithm');
+        }
+
+        // Verify signature
+        $validSig = hash_hmac('sha256', "$b64header.$b64payload", $secret, true);
+        if (!hash_equals($validSig, $sig)) {
+            throw new \RuntimeException('Invalid JWT signature');
+        }
+
+        // Expiration check
+        if (isset($payload['exp']) && time() >= $payload['exp']) {
+            throw new \RuntimeException('JWT expired');
+        }
+
+        return $payload;
+    }
+
+    /**
+     * Perform a single sign-on from Joomla to NextAuth-powered Next.js app.
+     */
+    function singleSignOn(): void
+    {
+        $userId = 'd0c9d39f-cc98-4f86-9266-7934666eeb35';
+        $userSecret = 'n4Aowtcna_DR7OoekqSwZl2xhex2UafkKoJHWDbEz00';
+
+
+        // Site A endpoints
+        $siteA_base = 'https://agent.dreamztrack.com.my';
+        $ssoEndpoint = $siteA_base . '/api/auth/callback/credentials-sso';
+
+        // Create SSO JWT on server
+        $payload = ['sub' => $userId, 'iat' => time(), 'exp' => time() + 60];
+        $ssoJwt = $this->jwt_encode($payload, $userSecret);
+
+        // Emit HTML + JS
+        echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"';
+        echo '><meta name="viewport" content="width=device-width, initial-scale=1.0"';
+        echo '><title>Single Sign-On Redirect</title></head><body>';
+        echo '<script>
+';
+        echo "const ssoToken = '" . addslashes($ssoJwt) . "';\n";
+        echo "const callbackUrl = '" . addslashes($siteA_base . '/') . "';\n";
+        echo "fetch('" . addslashes($siteA_base) . "/api/auth/csrf', { credentials: 'include' })\n";
+        echo "  .then(res => res.json())\n";
+        echo "  .then(data => {\n";
+        echo "    const csrf = data.csrfToken;\n";
+        echo "    const form = document.createElement('form');\n";
+        echo "    form.method = 'POST';\n";
+        echo "    form.action = '" . addslashes($ssoEndpoint) . "';\n";
+        echo "    ['csrfToken', 'token', 'callbackUrl'].forEach(name => {\n";
+        echo "      const input = document.createElement('input');\n";
+        echo "      input.type = 'hidden';\n";
+        echo "      input.name = name;\n";
+        echo "      input.value = name === 'csrfToken' ? csrf : (name === 'token' ? ssoToken : callbackUrl);\n";
+        echo "      form.appendChild(input);\n";
+        echo "    });\n";
+        echo "    document.body.appendChild(form);\n";
+        echo "    form.submit();\n";
+        echo "  });\n";
+        echo '</script></body></html>';
+        exit;
+    }
+
+    /**
+     * Get a list of keywords from unicornr_workflows where type = 2.
+     *
+     * @return array Array containing the list of keywords
+     */
+    function getKeywords()
+    {
+        try {
+            $db = JFactory::getDbo();
+            $query = $db->getQuery(true)
+                ->select($db->quoteName('keyword'))
+                ->from($db->quoteName('#__unicornr_workflows'))
+                ->where($db->quoteName('type') . ' = 2');
+            $db->setQuery($query);
+            $keywords = $db->loadColumn();
+            if ($db->getErrorNum()) {
+                throw new Exception('Database error while fetching keywords: ' . $db->stderr());
+            }
+            header('Content-Type: application/json');
+            echo json_encode($keywords);
+            exit;
+        } catch (Exception $e) {
+            header('Content-Type: application/json');
+            echo json_encode([]);
+            exit;
+        }
+    }
+
+    function processKeywords()
+    {
+        // Get raw POST body
+        $payload = file_get_contents('php://input');
+        $data = json_decode($payload, true);
+        if (!$data || !isset($data['messages'][0]['text']['body'])) {
+            header('Content-Type: application/json');
+            echo json_encode(['success' => false, 'error' => 'Invalid payload or missing message body.']);
+            exit;
+        }
+
+        $messageBody = $data['messages'][0]['text']['body'];
+
+        // Fetch all active workflows of type=2
+        $db = JFactory::getDbo();
+        $query = $db->getQuery(true)
+            ->select('*')
+            ->from($db->quoteName('#__unicornr_workflows'))
+            ->where($db->quoteName('type') . ' = 2')
+            ->where($db->quoteName('state') . ' = 1');
+        $db->setQuery($query);
+        $workflowRows = $db->loadObjectList();
+
+        if (empty($workflowRows)) {
+            header('Content-Type: application/json');
+            echo json_encode(['success' => false, 'error' => 'No workflows found.']);
+            exit;
+        }
+
+        $matched = false;
+        $scheduleTimes = [];
+        foreach ($workflowRows as $workflowRow) {
+            if (!empty($workflowRow->keyword) && stripos($messageBody, $workflowRow->keyword) !== false) {
+                // Found a matching keyword, trigger workflow(s)
+                if (!empty($workflowRow->workflow)) {
+                    $workflows = json_decode($workflowRow->workflow, true);
+                    if (is_array($workflows)) {
+                        foreach ($workflows as $wf) {
+                            // Calculate schedule_date_time based on workflow time/unit and user's timezone
+                            $interval = isset($wf['time']) ? (int) $wf['time'] : 0;
+                            $unit = isset($wf['unit']) ? strtolower($wf['unit']) : 'minutes';
+
+                            $userTimezone = Factory::getUser()->getTimezone()->getName();
+                            // Set eventDate to 8:00 AM in user's timezone
+                            $eventDate = new \Joomla\CMS\Date\Date('now', 'UTC');
+                            $eventDate->setTimezone(new DateTimeZone($userTimezone));
+
+                            // Apply interval
+                            if ($interval > 0) {
+                                switch ($unit) {
+                                    case 'minutes':
+                                        $eventDate->modify('+' . $interval . ' minutes');
+                                        break;
+                                    case 'days':
+                                        $eventDate->modify('+' . $interval . ' days');
+                                        break;
+                                    case 'weeks':
+                                        $eventDate->modify('+' . $interval . ' weeks');
+                                        break;
+                                    default:
+                                        $eventDate->modify('+' . $interval . ' minutes');
+                                }
+                            }
+                            $scheduleDateTime = $eventDate->format('Y-m-d H:i:s', true);
+                            $scheduleTimes[] = $scheduleDateTime;
+                            $scheduleTimes[] = $scheduleDateTime;
+
+                            $postFields = [
+                                'dreamztrack_user' => '68',
+                                'function' => 'storeScheduleMessage',
+                                'method' => 'apiWebhook',
+                                'type' => 'contact',
+                                'target' => $data['messages'][0]['from'],
+                                'schedule_date_time' => $scheduleDateTime,
+                                'template' => $workflowRow->name . '_' . $workflowRow->id,
+                                'custom_field_1' => !empty($wf['image']) ? 'Send Image' : 'Send Message Only',
+                                'custom_field_2' => isset($wf['message']) ? $wf['message'] : $messageBody,
+                            ];
+
+                            $ch = curl_init('https://whatsapp.dreamztrack.com.my/index.php?option=com_ajax&plugin=downloadwhatsappcontacts&format=raw');
+                            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                            curl_setopt($ch, CURLOPT_POST, true);
+
+                            if (!empty($wf['image'])) {
+                                $imagePath = $wf['image'];
+                                $tmpFile = tempnam(sys_get_temp_dir(), 'wfimg_');
+                                file_put_contents($tmpFile, file_get_contents($imagePath));
+                                $postFields['file'] = new CURLFile($tmpFile, mime_content_type($tmpFile), basename($imagePath));
+                                curl_setopt($ch, CURLOPT_POSTFIELDS, $postFields);
+                            } else {
+                                curl_setopt($ch, CURLOPT_POSTFIELDS, $postFields);
+                            }
+
+                            $response = curl_exec($ch);
+                            $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                            $curlErrorNum = curl_errno($ch);
+                            $curlError = curl_error($ch);
+                            curl_close($ch);
+
+                            if (!empty($wf['image']) && isset($tmpFile) && file_exists($tmpFile)) {
+                                unlink($tmpFile);
+                            }
+
+                            if ($curlErrorNum !== 0 || $httpcode != 200) {
+                                header('Content-Type: application/json');
+                                echo json_encode([
+                                    'success' => false,
+                                    'error' => 'Failed to send workflow message.',
+                                    'curl_error' => $curlError,
+                                    'http_code' => $httpcode,
+                                    'response' => $response
+                                ]);
+                                exit;
+                            }
+                        }
+                        $matched = true;
+                    }
+                }
+            }
+        }
+
+        header('Content-Type: application/json');
+        if ($matched) {
+            echo json_encode(['success' => true, 'message' => 'Workflow(s) triggered.', 'schedule_date_times' => $scheduleTimes]);
+        } else {
+            echo json_encode(['success' => false, 'message' => 'No matching keyword found in message.', 'schedule_date_times' => $scheduleTimes]);
+        }
+        exit;
+    }
+
+    /**
+     * Notify assigned members of transaction status changes (for cron job)
+     *
+     * This function should be called every minute by a cron job (via CLI or web cron).
+     * It checks moz70_unicornr_transaction_status_log for entries with notified_to_user = 0,
+     * fetches the transaction and assigned members, gets the workflow message, sends the message,
+     * and marks the log as notified.
+     *
+     * @return array Summary of notifications sent
+     */
+    public function notifyTransactionStatusChange()
+    {
+        $db = JFactory::getDbo();
+        $results = [];
+
+        $user = \Joomla\CMS\Factory::getUser();
+        $tz = $user && method_exists($user, 'getTimezone') ? $user->getTimezone() : null;
+        if ($tz instanceof \DateTimeZone) {
+            $userTimezone = $tz->getName();
+        } elseif (is_string($tz) && !empty($tz)) {
+            $userTimezone = $tz;
+        } else {
+            $userTimezone = 'Asia/Kuala_Lumpur';
+        }
+
+        try {
+            // 1. Get all unnotified status changes
+            $query = $db->getQuery(true)
+                ->select('*')
+                ->from($db->quoteName('#__unicornr_transaction_status_log'))
+                ->where($db->quoteName('notified_to_user') . ' = 0');
+            $db->setQuery($query);
+            $logRows = $db->loadObjectList();
+
+            if (empty($logRows)) {
+                return ['success' => true, 'message' => 'No unnotified status changes.'];
+            }
+
+            $allWorkflowDetails = [];
+            $allScheduleTimes = [];
+            foreach ($logRows as $logRow) {
+                $transactionId = $logRow->transaction_id;
+                // 2. Get transaction
+                $txQuery = $db->getQuery(true)
+                    ->select('*')
+                    ->from($db->quoteName('#__unicornr_transaction'))
+                    ->where($db->quoteName('id') . ' = ' . (int) $transactionId);
+                $db->setQuery($txQuery);
+                $transaction = $db->loadObject();
+                if (!$transaction) {
+                    $results[] = [
+                        'transaction_id' => $transactionId,
+                        'status' => 'error',
+                        'message' => 'Transaction not found.'
+                    ];
+                    continue;
+                }
+
+                // Lookup before_status and after_status text from unicornr_transaction_custom
+                $beforeStatusId = isset($logRow->before_transstatus) ? (int) $logRow->before_transstatus : null;
+                $afterStatusId = isset($logRow->after_transstatus) ? (int) $logRow->after_transstatus : null;
+                $statusTextMap = [];
+                $statusIdsToLookup = [];
+                if ($beforeStatusId)
+                    $statusIdsToLookup[] = $beforeStatusId;
+                if ($afterStatusId)
+                    $statusIdsToLookup[] = $afterStatusId;
+                if (!empty($statusIdsToLookup)) {
+                    $statusQuery = $db->getQuery(true)
+                        ->select('id, fielddata')
+                        ->from($db->quoteName('#__unicornr_transaction_custom'))
+                        ->where($db->quoteName('id') . ' IN (' . implode(',', array_map('intval', $statusIdsToLookup)) . ')');
+                    $db->setQuery($statusQuery);
+                    $statusRows = $db->loadAssocList('id', 'fielddata');
+                    if ($statusRows && is_array($statusRows)) {
+                        $statusTextMap = $statusRows;
+                    }
+                }
+                // 3. Get assigned members (comma-separated codes)
+                $assignedMembers = [];
+                if (!empty($transaction->assignedmember)) {
+                    $codes = explode(',', $transaction->assignedmember);
+                    foreach ($codes as $code) {
+                        $trimmed = trim($code);
+                        if ($trimmed !== '') {
+                            $assignedMembers[] = $trimmed;
+                        }
+                    }
+                }
+                if (empty($assignedMembers)) {
+                    $results[] = [
+                        'transaction_id' => $transactionId,
+                        'status' => 'skipped',
+                        'message' => 'No assigned members.'
+                    ];
+                    // Still mark as notified to avoid repeated attempts
+                    $this->markStatusLogNotified($logRow->id);
+                    continue;
+                }
+
+                // 4. Get member contact info
+                $memberQuery = $db->getQuery(true)
+                    ->select('code, name, hphone, email')
+                    ->from($db->quoteName('#__unicornr_table_member'))
+                    ->where($db->quoteName('code') . ' IN (' . implode(',', array_map([$db, 'quote'], $assignedMembers)) . ')');
+                $db->setQuery($memberQuery);
+                $members = $db->loadObjectList('code');
+
+                // 5. Get workflow (based on transaction type and status change)
+                $workflow = null;
+                $workflowQuery = $db->getQuery(true)
+                    ->select('*')
+                    ->from($db->quoteName('#__unicornr_workflows'))
+                    ->where($db->quoteName('type') . ' IN (5,6)')
+                    ->where($db->quoteName('state') . ' = 1');
+                $db->setQuery($workflowQuery);
+                $workflows = $db->loadObjectList();
+
+                // Determine transaction type: 1=AGM, 2=Resolution
+                $transactionType = isset($transaction->transtype) ? (int) $transaction->transtype : 0;
+                $workflowFieldType = null;
+                if ($transactionType === 1) {
+                    $workflowFieldType = 5; // AGM
+                } elseif ($transactionType === 2) {
+                    $workflowFieldType = 6; // Resolution
+                }
+                $transactionStatus = isset($transaction->transstatus) ? $transaction->transstatus : null;
+                // Find matching workflow
+                foreach ($workflows as $wfRow) {
+                    // Only notify if afterStatusId matches workflow updatetype
+                    if (
+                        isset($wfRow->type) && (int) $wfRow->type === $workflowFieldType &&
+                        isset($wfRow->updatetype) && $afterStatusId !== null && $wfRow->updatetype == $afterStatusId
+                    ) {
+                        $workflow = $wfRow;
+                        break;
+                    }
+                }
+
+                // If no workflow found, skip everything for this transaction
+                if (!$workflow) {
+                    // Mark as notified to avoid repeated attempts
+                    $this->markStatusLogNotified($logRow->id);
+                    continue;
+                }
+
+                // 6. Prepare message and image support
+                $scheduleTimes = [];
+                $workflowDetails = [];
+                $sendResults = [];
+                if (empty($workflow->workflow)) {
+                    // Mark as notified to avoid repeated attempts
+                    $this->markStatusLogNotified($logRow->id);
+                    continue;
+                }
+                $wfDecoded = json_decode($workflow->workflow, true);
+                if (!is_array($wfDecoded) || count($wfDecoded) === 0) {
+                    // Mark as notified to avoid repeated attempts
+                    $this->markStatusLogNotified($logRow->id);
+                    continue;
+                }
+                foreach ($wfDecoded as $wfItem) {
+
+                    // Build workflowDetails for each workflow item
+                    $interval = isset($wfItem['time']) ? (int) $wfItem['time'] : 0;
+                    $unit = isset($wfItem['unit']) ? strtolower($wfItem['unit']) : 'minutes';
+                    $scheduleDate = new \Joomla\CMS\Date\Date('now', 'UTC');
+                    $scheduleDate->setTimezone(new \DateTimeZone($userTimezone));
+                    if ($interval > 0) {
+                        switch ($unit) {
+                            case 'minutes':
+                                $scheduleDate->modify('+' . $interval . ' minutes');
+                                break;
+                            case 'days':
+                                $scheduleDate->modify('+' . $interval . ' days');
+                                break;
+                            case 'weeks':
+                                $scheduleDate->modify('+' . $interval . ' weeks');
+                                break;
+                            default:
+                                $scheduleDate->modify('+' . $interval . ' minutes');
+                        }
+                    }
+                    $scheduleDateTime = $scheduleDate->format('Y-m-d H:i:s', true);
+                    $scheduleTimes[] = $scheduleDateTime;
+                    $workflowDetails[] = [
+                        'workflow_name' => $workflow->name,
+                        'workflow_id' => $workflow->id,
+                        'message' => isset($wfItem['message']) ? $wfItem['message'] : null,
+                        'image' => isset($wfItem['image']) ? $wfItem['image'] : null,
+                        'schedule_date_time' => $scheduleDateTime
+                    ];
+                }
+
+                // Now send notifications for each workflow item (not just the first)
+                foreach ($workflowDetails as $wfDetail) {
+                    $msgTemplate = isset($wfDetail['message']) ? $wfDetail['message'] : null;
+                    $scheduleDateTime = isset($wfDetail['schedule_date_time']) ? $wfDetail['schedule_date_time'] : date('Y-m-d H:i:s');
+                    if ($msgTemplate) {
+                        foreach ($members as $member) {
+                            $target = $member->hphone;
+                            if (empty($target)) {
+                                $sendResults[] = [
+                                    'member_code' => $member->code,
+                                    'status' => 'skipped',
+                                    'message' => 'No phone number.'
+                                ];
+                                continue;
+                            }
+
+                            // Get company name from clientdata
+                            $companyName = '';
+                            if (!empty($transaction->assignedcompany)) {
+                                $companyQuery = $db->getQuery(true)
+                                    ->select('name')
+                                    ->from($db->quoteName('#__unicornr_table_clientdata'))
+                                    ->where($db->quoteName('clientcode') . ' = ' . $db->quote($transaction->assignedcompany));
+                                $db->setQuery($companyQuery);
+                                $companyName = $db->loadResult();
+                            }
+
+                            // Format event_date in user's timezone as 'l, d F Y' at 8:00 AM
+                            $formattedEventDate = '';
+                            if (isset($transaction->createddate) && !empty($transaction->createddate)) {
+                                try {
+                                    $eventDate = new \Joomla\CMS\Date\Date($transaction->createddate, 'UTC');
+                                    $eventDate->setTimezone(new \DateTimeZone($userTimezone));
+                                    $eventDate->setTime(8, 0, 0);
+                                    $formattedEventDate = $eventDate->format('l, d F Y');
+                                } catch (\Exception $ex) {
+                                    $formattedEventDate = $transaction->createddate;
+                                }
+                            }
+
+                            // Replace variables, including user name
+                            $replacements = [
+                                '{user_name}' => isset($member->name) ? $member->name : '',
+                                '{company}' => $companyName,
+                                '{transaction_topic}' => isset($transaction->topic) ? $transaction->topic : '',
+                                '{event_date}' => $formattedEventDate,
+                                '{before_status}' => isset($statusTextMap[$beforeStatusId]) ? $statusTextMap[$beforeStatusId] : $logRow->before_transstatus,
+                                '{after_status}' => isset($statusTextMap[$afterStatusId]) ? $statusTextMap[$afterStatusId] : $logRow->after_transstatus,
+                            ];
+                            $messageBody = strtr($msgTemplate, $replacements);
+
+                            $postFields = [
+                                'dreamztrack_user' => '68',
+                                'function' => 'storeScheduleMessage',
+                                'method' => 'apiWebhook',
+                                'type' => 'contact',
+                                'target' => $target,
+                                'schedule_date_time' => $scheduleDateTime,
+                                'template' => $workflow ? ($workflow->name . '_' . $workflow->id) : ('TransactionStatusChange_' . $transactionId),
+                                'custom_field_1' => !empty($wfDetail['image']) ? 'Send Image' : 'Send Message Only',
+                                'custom_field_2' => $messageBody,
+                            ];
+                            //die(var_dump(['postFields' => $postFields, 'image' => $image]));
+
+                            $ch = curl_init('https://whatsapp.dreamztrack.com.my/index.php?option=com_ajax&plugin=downloadwhatsappcontacts&format=raw');
+                            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                            curl_setopt($ch, CURLOPT_POST, true);
+
+                            // die(var_dump($wfDetail));
+                            if (!empty($wfDetail['image'])) {
+                                $imagePath = $wfDetail['image'];
+                                $tmpFile = tempnam(sys_get_temp_dir(), 'wfimg_');
+                                file_put_contents($tmpFile, file_get_contents($imagePath));
+                                $postFields['file'] = new CURLFile($tmpFile, mime_content_type($tmpFile), basename($imagePath));
+                                curl_setopt($ch, CURLOPT_POSTFIELDS, $postFields);
+                                //die('here');
+                            } else {
+                                curl_setopt($ch, CURLOPT_POSTFIELDS, $postFields);
+                                //die('here2');
+                            }
+
+                            $response = curl_exec($ch);
+                            $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                            $curlErrorNum = curl_errno($ch);
+                            $curlError = curl_error($ch);
+                            curl_close($ch);
+
+                            if (!empty($wfDetail['image']) && isset($tmpFile) && file_exists($tmpFile)) {
+                                unlink($tmpFile);
+                            }
+
+                            if ($curlErrorNum !== 0 || $httpcode != 200) {
+                                $sendResults[] = [
+                                    'member_code' => $member->code,
+                                    'status' => 'error',
+                                    'curl_error' => $curlError,
+                                    'http_code' => $httpcode,
+                                    'response' => $response
+                                ];
+                            } else {
+                                $sendResults[] = [
+                                    'member_code' => $member->code,
+                                    'status' => 'sent',
+                                    'response' => $response
+                                ];
+                            }
+                        }
+                    }
+                }
+
+                $allWorkflowDetails = array_merge($allWorkflowDetails, $workflowDetails);
+                $allScheduleTimes = array_merge($allScheduleTimes, $scheduleTimes);
+
+                // Only add to results if a workflow was found and message sent
+                if (!empty($workflowDetails) && !empty($sendResults)) {
+                    $results[] = [
+                        'transaction_id' => $transactionId,
+                        'notified_members' => $sendResults
+                    ];
+                    // Mark as notified after successful send
+                    $this->markStatusLogNotified($logRow->id);
+                }
+            }
+            return [
+                'results' => $results,
+                'workflow_details' => $allWorkflowDetails,
+                'schedule_times' => $allScheduleTimes
+            ];
+        } catch (Exception $e) {
+            return ['error' => $e->getMessage()];
+        }
+    }
+
+    /**
+     * Helper to mark a status log row as notified
+     */
+    private function markStatusLogNotified($logId)
+    {
+        $db = JFactory::getDbo();
+        $query = $db->getQuery(true)
+            ->update($db->quoteName('#__unicornr_transaction_status_log'))
+            ->set($db->quoteName('notified_to_user') . ' = 1')
+            ->where($db->quoteName('id') . ' = ' . (int) $logId);
+        $db->setQuery($query);
+        $db->execute();
     }
 }

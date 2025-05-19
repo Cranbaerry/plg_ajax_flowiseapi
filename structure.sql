@@ -625,6 +625,10 @@ CREATE TABLE moz70_unicornr_transaction (
   remark text NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Add notified_to_user field to transaction status log table
+ALTER TABLE moz70_unicornr_transaction_status_log
+  ADD COLUMN notified_to_user TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'Whether the status change has been notified to users';
+
 CREATE TABLE moz70_unicornr_transaction_custom (
   id int(10) UNSIGNED NOT NULL,
   state tinyint(1) NOT NULL DEFAULT 1,
