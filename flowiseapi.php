@@ -179,11 +179,10 @@ class PlgAjaxFlowiseapi extends JPlugin
      *               containing the following keys:
      *               - 'company_info': (object) Basic details of the company (id, name, code, etc.).
      *               - 'transactions': (array) List of transactions associated with the company. Each transaction is an object.
-     *               - 'shareholders': (array) List of shareholders for the company. Each shareholder is an object with details like name, shares, etc.
      *               - 'certificates': (array) List of share certificates issued by the company. Each certificate is an associative array.
      *               - 'upcoming_share_price': (string) The latest upcoming share price from history logs, or a default message if none found.
-     *               - 'company_members': (array) List of company members.
-     *               - 'company_directors': (array) List of company directors.
+     *               - 'company_members': (array) List of company members. Each member includes total_shares and share_percentage.
+     *               - 'company_directors': (array) List of company directors. Each director includes total_shares and share_percentage.
      *
      * @example Call via: index.php?option=com_ajax&plugin=flowiseapi&format=json&method=getCompanyDetails&phone_number=0123456789
      */
@@ -306,6 +305,42 @@ class PlgAjaxFlowiseapi extends JPlugin
             }
             $companyCodesIn = implode(',', $companyCodesQuoted);
 
+            // --- 4. Fetch Shareholders with Share Counts and Percentages from table_regmem ---
+            // Build a map of [clientcode][memcode] => ['total_shares' => ..., 'share_percentage' => ...]
+            $shareInfoMap = array();
+            if (!empty($companyCodesIn)) {
+                $shQuery = $db->getQuery(true);
+                $shQuery->select(array(
+                    $db->quoteName('a.clientcode'),
+                    $db->quoteName('a.memcode'),
+                    $db->quoteName('a.Tnoshares', 'total_shares'),
+                    $db->quoteName('a.Percent', 'share_percentage')
+                ))
+                    ->from($db->quoteName('#__unicornr_table_regmem', 'a'))
+                    ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
+                    ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
+                    ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'));
+
+                $db->setQuery($shQuery);
+                $shareholdersList = $db->loadObjectList();
+                if ($db->getErrorNum()) {
+                    throw new Exception('Database error while fetching shareholders from table_regmem: ' . $db->stderr());
+                }
+                foreach ($shareholdersList as $sh) {
+                    $clientcode = $sh->clientcode;
+                    $memcode = $sh->memcode;
+                    $total_shares = is_numeric($sh->total_shares) ? (float) $sh->total_shares : 0;
+                    $share_percentage = is_numeric($sh->share_percentage) ? (float) $sh->share_percentage : 0;
+                    if (!isset($shareInfoMap[$clientcode])) {
+                        $shareInfoMap[$clientcode] = array();
+                    }
+                    $shareInfoMap[$clientcode][$memcode] = array(
+                        'total_shares' => $total_shares,
+                        'share_percentage' => $share_percentage
+                    );
+                }
+            }
+
             // --- Fetch Company Members ---
             $companyMembers = array();
             if (!empty($companyCodesIn)) {
@@ -313,16 +348,13 @@ class PlgAjaxFlowiseapi extends JPlugin
                 $memQuery->select(array(
                     $db->quoteName('a.clientcode'),
                     $db->quoteName('b.code'),
-                    $db->quoteName('b.name'),
+                    $db->quoteName('b.name')
                 ))
                     ->from($db->quoteName('#__unicornr_table_regmem', 'a'))
                     ->join('LEFT', $db->quoteName('#__unicornr_table_member', 'b') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('b.code'))
-                    ->join('LEFT', $db->quoteName('#__unicornr_table_shares', 'c') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('c.memcode'))
                     ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
                     ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
                     ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
-                    ->where($db->quoteName('c.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
-                    ->group($db->quoteName('b.code'))
                     ->order($db->quoteName('b.name') . ' ASC');
 
                 $db->setQuery($memQuery);
@@ -334,7 +366,14 @@ class PlgAjaxFlowiseapi extends JPlugin
                     if (!isset($companyMembers[$mem->clientcode])) {
                         $companyMembers[$mem->clientcode] = array();
                     }
-                    $companyMembers[$mem->clientcode][] = $mem;
+                    $memberObj = clone $mem;
+                    unset($memberObj->clientcode);
+                    // Add share info if available
+                    $memcode = $mem->code;
+                    $clientcode = $mem->clientcode;
+                    $memberObj->total_shares = isset($shareInfoMap[$clientcode][$memcode]) ? $shareInfoMap[$clientcode][$memcode]['total_shares'] : 0;
+                    $memberObj->share_percentage = isset($shareInfoMap[$clientcode][$memcode]) ? $shareInfoMap[$clientcode][$memcode]['share_percentage'] : 0;
+                    $companyMembers[$mem->clientcode][] = $memberObj;
                 }
             }
 
@@ -363,7 +402,14 @@ class PlgAjaxFlowiseapi extends JPlugin
                     if (!isset($companyDirectors[$dir->clientcode])) {
                         $companyDirectors[$dir->clientcode] = array();
                     }
-                    $companyDirectors[$dir->clientcode][] = $dir;
+                    $directorObj = clone $dir;
+                    unset($directorObj->clientcode);
+                    // Add share info if available
+                    $memcode = $dir->code;
+                    $clientcode = $dir->clientcode;
+                    $directorObj->total_shares = isset($shareInfoMap[$clientcode][$memcode]) ? $shareInfoMap[$clientcode][$memcode]['total_shares'] : 0;
+                    $directorObj->share_percentage = isset($shareInfoMap[$clientcode][$memcode]) ? $shareInfoMap[$clientcode][$memcode]['share_percentage'] : 0;
+                    $companyDirectors[$dir->clientcode][] = $directorObj;
                 }
             }
 
@@ -473,38 +519,38 @@ class PlgAjaxFlowiseapi extends JPlugin
             }
 
             // --- 4. Fetch Shareholders with Share Counts and Percentages from table_regmem ---
-            $shareholders = array();
+            // Build a map of [clientcode][memcode] => ['total_shares' => ..., 'share_percentage' => ...]
+            $shareInfoMap = array();
             if (!empty($companyCodesIn)) {
                 $shQuery = $db->getQuery(true);
                 $shQuery->select(array(
                     $db->quoteName('a.clientcode'),
                     $db->quoteName('a.memcode'),
-                    $db->quoteName('b.name', 'member_name'),
                     $db->quoteName('a.Tnoshares', 'total_shares'),
                     $db->quoteName('a.Percent', 'share_percentage')
                 ))
                     ->from($db->quoteName('#__unicornr_table_regmem', 'a'))
-                    ->leftJoin($db->quoteName('#__unicornr_table_member', 'b') . ' ON ' . $db->quoteName('a.memcode') . ' = ' . $db->quoteName('b.code'))
                     ->where($db->quoteName('a.clientcode') . ' IN (' . $companyCodesIn . ')')
                     ->where($db->quoteName('a.state') . ' = ' . $db->quote(1))
-                    ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'))
-                    ->order($db->quoteName('a.clientcode') . ' ASC, ' . $db->quoteName('b.name') . ' ASC');
+                    ->where($db->quoteName('a.docease') . ' = ' . $db->quote('0000-00-00 00:00:00'));
 
                 $db->setQuery($shQuery);
                 $shareholdersList = $db->loadObjectList();
                 if ($db->getErrorNum()) {
                     throw new Exception('Database error while fetching shareholders from table_regmem: ' . $db->stderr());
                 }
-
-                // Group shareholders by company code
                 foreach ($shareholdersList as $sh) {
-                    // Ensure numeric types for consistency
-                    $sh->total_shares = is_numeric($sh->total_shares) ? (float) $sh->total_shares : 0;
-                    $sh->share_percentage = is_numeric($sh->share_percentage) ? (float) $sh->share_percentage : 0;
-                    if (!isset($shareholders[$sh->clientcode])) {
-                        $shareholders[$sh->clientcode] = array();
+                    $clientcode = $sh->clientcode;
+                    $memcode = $sh->memcode;
+                    $total_shares = is_numeric($sh->total_shares) ? (float) $sh->total_shares : 0;
+                    $share_percentage = is_numeric($sh->share_percentage) ? (float) $sh->share_percentage : 0;
+                    if (!isset($shareInfoMap[$clientcode])) {
+                        $shareInfoMap[$clientcode] = array();
                     }
-                    $shareholders[$sh->clientcode][] = $sh;
+                    $shareInfoMap[$clientcode][$memcode] = array(
+                        'total_shares' => $total_shares,
+                        'share_percentage' => $share_percentage
+                    );
                 }
             }
 
@@ -621,13 +667,20 @@ class PlgAjaxFlowiseapi extends JPlugin
                 }
             }
 
+            $clientInfo = null;
+            $clientQuery = $db->getQuery(true)
+                ->select(array('name', 'hphone', 'code'))
+                ->from($db->quoteName('#__unicornr_table_member'))
+                ->where($db->quoteName('hphone') . ' = ' . $db->quote($phone_number));
+            $db->setQuery($clientQuery);
+            $clientInfo = $db->loadAssoc();
 
             // --- 7. Assemble Results ---
             foreach ($companies as $clientcode => $company) {
                 $results[] = array(
+                    'client_info' => $clientInfo ?: new stdClass(),
                     'company_info' => $company,
                     'transactions' => isset($transactions[$clientcode]) ? $transactions[$clientcode] : array(),
-                    'shareholders' => isset($shareholders[$clientcode]) ? $shareholders[$clientcode] : array(),
                     'certificates' => isset($certificates[$clientcode]) ? $certificates[$clientcode] : array(),
                     'upcoming_share_price' => isset($upcomingSharePrices[$clientcode]) ? $upcomingSharePrices[$clientcode] : 'No Upcoming Share Price',
                     'company_members' => isset($companyMembers[$clientcode]) ? $companyMembers[$clientcode] : array(),
